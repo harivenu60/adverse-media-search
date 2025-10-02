@@ -1,0 +1,214 @@
+# file: app.py
+
+from flask import Flask, request, render_template_string, flash, send_file
+import requests, re, difflib, io, csv
+from datetime import datetime, timedelta
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+import nltk
+
+nltk.download('vader_lexicon')
+
+app = Flask(__name__)
+app.secret_key = "change_this_secret"
+
+# === API KEYS (your real ones) ===
+NEWSDATA_API_KEY = "pub_6f6a5665efae4a90823bc0195a8343f5"
+NEWSAPI_API_KEY = "5b9afc75540c42a187ac83c8b61a165b"
+GNEWS_API_KEY = "ee87c2b5d536c77dcbac6474f06497e8"
+WORLDNEWS_API_KEY = ""   # leave empty if you don’t have it yet
+CURRENTS_API_KEY = ""    # leave empty if you don’t have it yet
+
+# === API Endpoints ===
+NEWSDATA_ENDPOINT = "https://newsdata.io/api/1/news"
+NEWSAPI_ENDPOINT = "https://newsapi.org/v2/everything"
+GNEWS_ENDPOINT = "https://gnews.io/api/v4/search"
+
+# Sanctions Lists
+OFAC_URL = "https://sanctionslistservice.ofac.treas.gov/api/Publication"
+UK_URL = "https://assets.publishing.service.gov.uk/government/uploads/system/uploads/attachment_data/file/1159796/UK_Sanctions_List.json"
+OPENSANCTIONS_URL = "https://api.opensanctions.org/datasets/default/entities/"
+
+# Initialize sentiment analyzer
+sia = SentimentIntensityAnalyzer()
+
+# ---------------------------
+# Helpers
+# ---------------------------
+def highlight_terms(text, terms):
+    for term in sorted(set(terms), key=lambda s: -len(s)):
+        text = re.sub(re.escape(term), f"<mark>{term}</mark>", text, flags=re.IGNORECASE)
+    return text
+
+def extract_snippet(text, match_terms, radius=120):
+    text_lower = text.lower()
+    for term in match_terms:
+        pos = text_lower.find(term.lower())
+        if pos >= 0:
+            start, end = max(0, pos-radius), min(len(text), pos+len(term)+radius)
+            return ("..." if start>0 else "") + text[start:end] + ("..." if end<len(text) else "")
+    return text[:radius*2] + "..."
+
+def is_negative(text):
+    if not text: return False
+    score = sia.polarity_scores(text)
+    return score["compound"] < -0.1
+
+# ---------------------------
+# Sanctions Fetchers
+# ---------------------------
+def fetch_ofac_list():
+    try:
+        resp = requests.get(OFAC_URL, timeout=30).json()
+        names = []
+        for entry in resp.get("SDNList", {}).get("SDNEntries", []):
+            if entry.get("lastName"): names.append(entry["lastName"])
+            if entry.get("firstName"): names.append(entry["firstName"])
+            for aka in entry.get("akaList", {}).get("aka", []):
+                if aka.get("akaName"): names.append(aka["akaName"])
+        return list(set(names))
+    except: return []
+
+def fetch_opensanctions():
+    try:
+        resp = requests.get(OPENSANCTIONS_URL, timeout=30).json()
+        return [e.get("properties", {}).get("name") for e in resp.get("results", []) if e.get("properties", {}).get("name")]
+    except: return []
+
+def fetch_uk_list():
+    try:
+        resp = requests.get(UK_URL, timeout=30).json()
+        return [x.get("Name") for x in resp if x.get("Name")]
+    except: return []
+
+def search_sanctions(name_query):
+    sanctioned = fetch_ofac_list() + fetch_opensanctions() + fetch_uk_list()
+    sanctioned = [s for s in sanctioned if s]
+    matches = []
+    for sname in sanctioned:
+        ratio = difflib.SequenceMatcher(None, name_query.lower(), sname.lower()).ratio()
+        if ratio >= 0.8:
+            matches.append({"sanctioned_name": sname, "similarity": round(ratio,2)})
+    return sorted(matches, key=lambda x: -x["similarity"])
+
+# ---------------------------
+# News API wrappers
+# ---------------------------
+def fetch_from_newsdata(query, from_date, to_date):
+    params = {"apikey": NEWSDATA_API_KEY, "q": query, "from_date": from_date, "to_date": to_date, "language": "en"}
+    r = requests.get(NEWSDATA_ENDPOINT, params=params).json()
+    return [{"title":a.get("title",""), "desc":a.get("description",""), "date":a.get("pubDate",""), "url":a.get("link",""), "source":"NewsData"} for a in r.get("results",[])]
+
+def fetch_from_newsapi(query, from_date, to_date):
+    params = {"apiKey": NEWSAPI_API_KEY, "q": query, "from": from_date, "to": to_date, "language": "en"}
+    r = requests.get(NEWSAPI_ENDPOINT, params=params).json()
+    return [{"title":a.get("title",""), "desc":a.get("description",""), "date":a.get("publishedAt",""), "url":a.get("url",""), "source":"NewsAPI"} for a in r.get("articles",[])]
+
+def fetch_from_gnews(query, from_date, to_date):
+    params = {"token": GNEWS_API_KEY, "q": query, "from": from_date, "to": to_date, "lang": "en"}
+    r = requests.get(GNEWS_ENDPOINT, params=params).json()
+    return [{"title":a.get("title",""), "desc":a.get("description",""), "date":a.get("publishedAt",""), "url":a.get("url",""), "source":"GNews"} for a in r.get("articles",[])]
+
+# ---------------------------
+# Unified search
+# ---------------------------
+def search_all(name, keywords, from_date, to_date):
+    query = " ".join([name]+keywords if name else keywords)
+    articles = []
+    articles += fetch_from_newsdata(query, from_date, to_date)
+    articles += fetch_from_newsapi(query, from_date, to_date)
+    articles += fetch_from_gnews(query, from_date, to_date)
+
+    results = []
+    for art in articles:
+        text = f"{art['title']} {art['desc']}"
+        if not any(kw.lower() in text.lower() for kw in keywords): continue
+        if not is_negative(text): continue
+        snippet = extract_snippet(text, keywords+[name])
+        results.append({
+            "title": art["title"], "source": art["source"], "date": art["date"],
+            "snippet": highlight_terms(snippet, keywords+[name]), "url": art["url"]
+        })
+    return results
+
+# ---------------------------
+# CSV Export
+# ---------------------------
+def generate_csv(news_results, sanctions_results):
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Type","Title/Name","Source","Date","URL/Similarity","Snippet"])
+    for r in news_results or []:
+        writer.writerow(["News", r["title"], r["source"], r["date"], r["url"], re.sub(r"<.*?>", "", r["snippet"])])
+    for s in sanctions_results or []:
+        writer.writerow(["Sanction", s["sanctioned_name"], "Sanctions DB", "", s["similarity"], ""])
+    buf.seek(0)
+    return io.BytesIO(buf.getvalue().encode("utf-8"))
+
+# ---------------------------
+# Flask UI
+# ---------------------------
+TEMPLATE = """
+<!doctype html><html><body style="font-family:Arial;max-width:900px;margin:auto;">
+<h2>Adverse News + Sanctions Search</h2>
+<form method="post">
+  Name: <input name="name" value="{{ request.form.name }}"><br>
+  Keywords (comma): <input name="keywords" value="{{ request.form.keywords }}"><br>
+  <button type="submit">Search</button>
+</form>
+
+{% if results %}
+<h3>Negative News Matches ({{ results|length }})</h3>
+{% for r in results %}
+<div style="border:1px solid #ccc;padding:8px;margin:6px;">
+  <b>{{ r.title }}</b><br>
+  <span style="color:#666;font-size:0.9em;">
+    Source: <strong>{{ r.source }}</strong> | Date: {{ r.date }}
+  </span><br><br>
+  {{ r.snippet|safe }}<br>
+  <a href="{{ r.url }}" target="_blank">🔗 Read full article</a>
+</div>
+{% endfor %}
+{% endif %}
+
+{% if ofac %}
+<h3>Sanctions Matches ({{ ofac|length }})</h3>
+<ul>
+{% for o in ofac %}
+  <li>{{ o.sanctioned_name }} (similarity: {{ o.similarity }})</li>
+{% endfor %}
+</ul>
+{% endif %}
+
+{% if results or ofac %}
+<form method="post" action="/download">
+  <button type="submit">Download CSV</button>
+</form>
+{% endif %}
+</body></html>
+"""
+
+@app.route("/", methods=["GET","POST"])
+def index():
+    global last_results, last_ofac
+    results, ofac_results = None, None
+    if request.method=="POST":
+        name = request.form.get("name","").strip()
+        kws = [k.strip() for k in request.form.get("keywords","").split(",") if k.strip()]
+        to_date = datetime.today().strftime("%Y-%m-%d")
+        from_date = (datetime.today()-timedelta(days=365*7)).strftime("%Y-%m-%d")
+        try:
+            results = search_all(name, kws, from_date, to_date)
+            ofac_results = search_sanctions(name) if name else []
+        except Exception as e:
+            flash(str(e))
+        last_results, last_ofac = results, ofac_results
+    return render_template_string(TEMPLATE, results=results, ofac=ofac_results, request=request)
+
+@app.route("/download", methods=["POST"])
+def download_csv():
+    buf = generate_csv(last_results, last_ofac)
+    return send_file(buf, as_attachment=True, download_name="adverse_results.csv", mimetype="text/csv")
+
+if __name__=="__main__":
+    last_results, last_ofac = None, None
+    app.run(debug=True, port=5000)
